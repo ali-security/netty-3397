@@ -48,6 +48,7 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
     private final int inputBufferSize;
     private DecoderJNI.Wrapper decoder;
     private boolean destroyed;
+    private boolean needsRead;
 
     /**
      * Creates a new BrotliDecoder with a default 8kB input buffer
@@ -64,15 +65,16 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
         this.inputBufferSize = ObjectUtil.checkPositive(inputBufferSize, "inputBufferSize");
     }
 
-    private ByteBuf pull(ByteBufAllocator alloc) {
+    private void forwardOutput(ChannelHandlerContext ctx) {
         ByteBuffer nativeBuffer = decoder.pull();
         // nativeBuffer actually wraps brotli's internal buffer so we need to copy its content
-        ByteBuf copy = alloc.buffer(nativeBuffer.remaining());
+        ByteBuf copy = ctx.alloc().buffer(nativeBuffer.remaining());
         copy.writeBytes(nativeBuffer);
-        return copy;
+        needsRead = false;
+        ctx.fireChannelRead(copy);
     }
 
-    private State decompress(ByteBuf input, List<Object> output, ByteBufAllocator alloc) {
+    private State decompress(ChannelHandlerContext ctx, ByteBuf input) {
         for (;;) {
             switch (decoder.getStatus()) {
                 case DONE:
@@ -84,7 +86,7 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
 
                 case NEEDS_MORE_INPUT:
                     if (decoder.hasOutput()) {
-                        output.add(pull(alloc));
+                        forwardOutput(ctx);
                     }
 
                     if (!input.isReadable()) {
@@ -98,7 +100,7 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
                     break;
 
                 case NEEDS_MORE_OUTPUT:
-                    output.add(pull(alloc));
+                    forwardOutput(ctx);
                     break;
 
                 default:
@@ -123,6 +125,7 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        needsRead = true;
         if (destroyed) {
             // Skip data received after finished.
             in.skipBytes(in.readableBytes());
@@ -134,7 +137,7 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
         }
 
         try {
-            State state = decompress(in, out, ctx.alloc());
+            State state = decompress(ctx, in);
             if (state == State.DONE) {
                 destroy();
             } else if (state == State.ERROR) {
@@ -169,5 +172,16 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
         } finally {
             super.channelInactive(ctx);
         }
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // Discard bytes of the cumulation buffer if needed.
+        discardSomeReadBytes();
+
+        if (needsRead && !ctx.channel().config().isAutoRead()) {
+            ctx.read();
+        }
+        ctx.fireChannelReadComplete();
     }
 }
